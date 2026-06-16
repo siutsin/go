@@ -97,6 +97,51 @@ func genAllocators() {
 		allocators[4].typ = "*SparseMapPos"
 		allocators[4].clear = "%s.Clear()"
 	}
+	compilerAllocators := []allocator{
+		{
+			name:     "RegStateSlice",
+			typ:      "[]regState",
+			capacity: "cap(%s)",
+			mak:      "make([]regState, %s)",
+			resize:   "%s[:%s]",
+			clear:    "clear(%[1]s[:cap(%[1]s)])",
+			minLog:   3,
+			maxLog:   32,
+		},
+		{
+			// These pools hold outer slice headers, so their backing arrays must
+			// be scanned. Separate typed pools avoid unsafe reinterpretation.
+			// Clearing the full capacity drops all inner backing arrays.
+			name:     "EndRegSliceSlice",
+			typ:      "[][]endReg",
+			capacity: "cap(%s)",
+			mak:      "make([][]endReg, %s)",
+			resize:   "%s[:%s]",
+			clear:    "clear(%[1]s[:cap(%[1]s)])",
+			minLog:   3,
+			maxLog:   32,
+		},
+		{
+			name:     "StartRegSliceSlice",
+			typ:      "[][]startReg",
+			capacity: "cap(%s)",
+			mak:      "make([][]startReg, %s)",
+			resize:   "%s[:%s]",
+			clear:    "clear(%[1]s[:cap(%[1]s)])",
+			minLog:   3,
+			maxLog:   32,
+		},
+		{
+			name:     "IDSliceSlice",
+			typ:      "[][]ssa.ID",
+			capacity: "cap(%s)",
+			mak:      "make([][]ssa.ID, %s)",
+			resize:   "%s[:%s]",
+			clear:    "clear(%[1]s[:cap(%[1]s)])",
+			minLog:   3,
+			maxLog:   32,
+		},
+	}
 	deriveds := []derived{
 		{
 			name: "BlockSlice",
@@ -157,12 +202,12 @@ func genAllocators() {
 	fmt.Fprintln(w, "\"unsafe\"")
 	fmt.Fprintln(w, ")")
 	for _, a := range allocators {
-		genAllocator(w, a)
+		genAllocator(w, a, "Cache", splitTitle)
 	}
 	for _, d := range deriveds {
 		for _, base := range allocators {
 			if base.name == d.base {
-				genDerived(w, d, base)
+				genDerived(w, d, base, "Cache", splitTitle)
 				break
 			}
 		}
@@ -180,10 +225,35 @@ func genAllocators() {
 	if err := os.WriteFile(outFile(allocatorsFile), b, 0666); err != nil {
 		log.Fatalf("can't write output: %v\n", err)
 	}
+
+	w.Reset()
+	fmt.Fprintf(w, "// Code generated from _gen/allocators.go using 'go generate'; DO NOT EDIT.\n")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "package ssacompile")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "import (")
+	fmt.Fprintln(w, "\"cmd/compile/internal/ssa\"")
+	fmt.Fprintln(w, "\"math/bits\"")
+	fmt.Fprintln(w, "\"sync\"")
+	fmt.Fprintln(w, ")")
+	for _, a := range compilerAllocators {
+		genAllocator(w, a, "compilerCache", identity)
+	}
+	b, err = format.Source(w.Bytes())
+	if err != nil {
+		fmt.Printf("%s\n", w.Bytes())
+		panic(err)
+	}
+
+	const compilerAllocatorsFile = "../ssacompile/allocators.go"
+	mkdirOutFile(compilerAllocatorsFile)
+	if err := os.WriteFile(outFile(compilerAllocatorsFile), b, 0666); err != nil {
+		log.Fatalf("can't write output: %v\n", err)
+	}
 }
-func genAllocator(w io.Writer, a allocator) {
+func genAllocator(w io.Writer, a allocator, cacheType string, title func(string) string) {
 	fmt.Fprintf(w, "var poolFree%s [%d]sync.Pool\n", a.name, a.maxLog-a.minLog)
-	fmt.Fprintf(w, "func (c *Cache) %s%s(n int) %s {\n", splitTitle("alloc"), a.name, a.typ)
+	fmt.Fprintf(w, "func (c *%s) %s%s(n int) %s {\n", cacheType, title("alloc"), a.name, a.typ)
 	fmt.Fprintf(w, "var s %s\n", a.typ)
 	fmt.Fprintf(w, "n2 := n\n")
 	fmt.Fprintf(w, "if n2 < %d { n2 = %d }\n", 1<<a.minLog, 1<<a.minLog)
@@ -206,7 +276,7 @@ func genAllocator(w io.Writer, a allocator) {
 	}
 	fmt.Fprintf(w, "return s\n")
 	fmt.Fprintf(w, "}\n")
-	fmt.Fprintf(w, "func (c *Cache) %s%s(s %s) {\n", splitTitle("free"), a.name, a.typ)
+	fmt.Fprintf(w, "func (c *%s) %s%s(s %s) {\n", cacheType, title("free"), a.name, a.typ)
 	fmt.Fprintf(w, "%s\n", fmt.Sprintf(a.clear, "s"))
 	fmt.Fprintf(w, "b := bits.Len(uint(%s) - 1)\n", fmt.Sprintf(a.capacity, "s"))
 	if a.typ[0] == '*' {
@@ -225,8 +295,8 @@ func genAllocator(w io.Writer, a allocator) {
 	}
 	fmt.Fprintf(w, "}\n")
 }
-func genDerived(w io.Writer, d derived, base allocator) {
-	fmt.Fprintf(w, "func (c *Cache) %s%s(n int) %s {\n", splitTitle("alloc"), d.name, d.typ)
+func genDerived(w io.Writer, d derived, base allocator, cacheType string, title func(string) string) {
+	fmt.Fprintf(w, "func (c *%s) %s%s(n int) %s {\n", cacheType, title("alloc"), d.name, d.typ)
 	if d.typ[:2] != "[]" || base.typ[:2] != "[]" {
 		panic(fmt.Sprintf("bad derived types: %s %s", d.typ, base.typ))
 	}
@@ -234,7 +304,7 @@ func genDerived(w io.Writer, d derived, base allocator) {
 	fmt.Fprintf(w, "var derived %s\n", d.typ[2:])
 	fmt.Fprintf(w, "if unsafe.Sizeof(base)%%unsafe.Sizeof(derived) != 0 { panic(\"bad\") }\n")
 	fmt.Fprintf(w, "scale := unsafe.Sizeof(base)/unsafe.Sizeof(derived)\n")
-	fmt.Fprintf(w, "b := c.%s%s(int((uintptr(n)+scale-1)/scale))\n", splitTitle("alloc"), base.name)
+	fmt.Fprintf(w, "b := c.%s%s(int((uintptr(n)+scale-1)/scale))\n", title("alloc"), base.name)
 	fmt.Fprintf(w, "s := unsafeheader.Slice {\n")
 	fmt.Fprintf(w, "  Data: unsafe.Pointer(&b[0]),\n")
 	fmt.Fprintf(w, "  Len: n,\n")
@@ -242,7 +312,7 @@ func genDerived(w io.Writer, d derived, base allocator) {
 	fmt.Fprintf(w, "  }\n")
 	fmt.Fprintf(w, "return *(*%s)(unsafe.Pointer(&s))\n", d.typ)
 	fmt.Fprintf(w, "}\n")
-	fmt.Fprintf(w, "func (c *Cache) %s%s(s %s) {\n", splitTitle("free"), d.name, d.typ)
+	fmt.Fprintf(w, "func (c *%s) %s%s(s %s) {\n", cacheType, title("free"), d.name, d.typ)
 	fmt.Fprintf(w, "var base %s\n", base.typ[2:])
 	fmt.Fprintf(w, "var derived %s\n", d.typ[2:])
 	fmt.Fprintf(w, "scale := unsafe.Sizeof(base)/unsafe.Sizeof(derived)\n")
@@ -251,6 +321,6 @@ func genDerived(w io.Writer, d derived, base allocator) {
 	fmt.Fprintf(w, "  Len: int((uintptr(len(s))+scale-1)/scale),\n")
 	fmt.Fprintf(w, "  Cap: int((uintptr(cap(s))+scale-1)/scale),\n")
 	fmt.Fprintf(w, "  }\n")
-	fmt.Fprintf(w, "c.%s%s(*(*%s)(unsafe.Pointer(&b)))\n", splitTitle("free"), base.name, base.typ)
+	fmt.Fprintf(w, "c.%s%s(*(*%s)(unsafe.Pointer(&b)))\n", title("free"), base.name, base.typ)
 	fmt.Fprintf(w, "}\n")
 }

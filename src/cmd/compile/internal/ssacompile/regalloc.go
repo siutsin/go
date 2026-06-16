@@ -638,6 +638,7 @@ func isLeaf(f *ssa.Func) bool {
 
 func (s *regAllocState) init(f *ssa.Func) {
 	s.f = f
+	cache := getCompilerCache(f.Cache)
 	s.f.RegAlloc = s.f.Cache.Locs[:0]
 	s.registers = f.Config.Registers
 	if nr := len(s.registers); nr == 0 || nr > int(noRegister) || nr > int(unsafe.Sizeof(ssaop.RegMask{})*8) {
@@ -732,7 +733,7 @@ func (s *regAllocState) init(f *ssa.Func) {
 		s.blockOrder[b.ID] = int32(i)
 	}
 
-	s.regs = make([]regState, s.numRegs)
+	s.regs = cache.allocRegStateSlice(int(s.numRegs))
 	nv := f.NumValues()
 	if cap(s.f.Cache.RegallocValues) >= nv {
 		s.f.Cache.RegallocValues = s.f.Cache.RegallocValues[:nv]
@@ -755,9 +756,9 @@ func (s *regAllocState) init(f *ssa.Func) {
 	}
 	s.computeLive()
 
-	s.endRegs = make([][]endReg, f.NumBlocks())
-	s.startRegs = make([][]startReg, f.NumBlocks())
-	s.spillLive = make([][]ssa.ID, f.NumBlocks())
+	s.endRegs = cache.allocEndRegSliceSlice(f.NumBlocks())
+	s.startRegs = cache.allocStartRegSliceSlice(f.NumBlocks())
+	s.spillLive = cache.allocIDSliceSlice(f.NumBlocks())
 	s.sdom = f.Sdom()
 
 	// wasm: Mark instructions that can be optimized to have their values only on the WebAssembly stack.
@@ -805,7 +806,13 @@ func (s *regAllocState) init(f *ssa.Func) {
 }
 
 func (s *regAllocState) close() {
+	cache := getCompilerCache(s.f.Cache)
 	s.f.Cache.FreeValueSlice(s.orig)
+	cache.freeRegStateSlice(s.regs)
+	cache.freeEndRegSliceSlice(s.endRegs)
+	cache.freeStartRegSliceSlice(s.startRegs)
+	cache.freeIDSliceSlice(s.spillLive)
+	cache.resetRegallocScratch()
 }
 
 // Adds a use record for id at distance dist from the start of the block.
@@ -2862,10 +2869,52 @@ func (e *edgeState) findRegFor(typ *types.Type) ssa.Location {
 	return nil
 }
 
+// Keep liveInfo pointer-free. regalloc caches bounded []liveInfo backing
+// arrays across functions. Do not add pointer fields unless the reset path
+// also clears the backing array.
 type liveInfo struct {
 	ID   ssa.ID   // ID of value
 	dist int32    // # of instructions before next use
 	pos  src.XPos // source position of next use
+}
+
+// Benchmarks found no gain from 64 entries over 32 and little gain above
+// 512 blocks. Larger functions use fresh scratch to limit retained memory.
+const (
+	maxCachedRegallocBlocks  = 512
+	maxCachedRegallocEntries = 32
+)
+
+func (c *compilerCache) resetRegallocScratch() {
+	if cap(c.regallocLive) > maxCachedRegallocBlocks {
+		c.regallocLive = nil
+	} else {
+		// Only the previous function's visible prefix could change. The hidden
+		// tail was reset when it was last visible.
+		live := c.regallocLive
+		for i := range live {
+			if cap(live[i]) > maxCachedRegallocEntries {
+				live[i] = nil
+			} else {
+				live[i] = live[i][:0]
+			}
+		}
+		c.regallocLive = live[:0]
+	}
+
+	if cap(c.regallocDesired) > maxCachedRegallocBlocks {
+		c.regallocDesired = nil
+	} else {
+		desired := c.regallocDesired
+		for i := range desired {
+			if cap(desired[i].entries) > maxCachedRegallocEntries {
+				desired[i] = desiredState{}
+			} else {
+				desired[i].reset()
+			}
+		}
+		c.regallocDesired = desired[:0]
+	}
 }
 
 // computeLive computes a map from block ID to a list of value IDs live at the end
@@ -2879,8 +2928,20 @@ func (s *regAllocState) computeLive() {
 		return
 	}
 	po := f.Postorder()
-	s.live = make([][]liveInfo, f.NumBlocks())
-	s.desired = make([]desiredState, f.NumBlocks())
+	cache := getCompilerCache(f.Cache)
+	// Reuse the bounded per-block live/desired scratch (see resetRegallocScratch).
+	if cap(cache.regallocLive) >= f.NumBlocks() {
+		s.live = cache.regallocLive[:f.NumBlocks()]
+	} else {
+		s.live = make([][]liveInfo, f.NumBlocks())
+	}
+	cache.regallocLive = s.live
+	if cap(cache.regallocDesired) >= f.NumBlocks() {
+		s.desired = cache.regallocDesired[:f.NumBlocks()]
+	} else {
+		s.desired = make([]desiredState, f.NumBlocks())
+	}
+	cache.regallocDesired = s.desired
 	s.loopnest = f.Loopnest()
 
 	rematIDs := make([]ssa.ID, 0, 64)
@@ -3360,6 +3421,10 @@ type desiredState struct {
 	// this data structure but are no longer.
 	avoid ssaop.RegMask
 }
+
+// Keep desiredStateEntry pointer-free. desiredState.reset keeps the entries
+// backing array for reuse. Do not add pointer fields unless reset also clears
+// that backing array.
 type desiredStateEntry struct {
 	// (pre-regalloc) value
 	ID ssa.ID

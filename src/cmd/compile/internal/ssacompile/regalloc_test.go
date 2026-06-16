@@ -6,6 +6,7 @@ package ssacompile
 
 import (
 	"fmt"
+	rtabi "internal/abi"
 	"testing"
 
 	"cmd/compile/internal/ssa"
@@ -536,5 +537,68 @@ func TestStartRegsDrop(t *testing.T) {
 	// Without startRegs mask cleanup we would have some dead LoadRegs added by shuffle
 	if rightLoadCount > 8 {
 		t.Errorf("expected <= 8 OpLoadReg in right block (got %d)", rightLoadCount)
+	}
+}
+
+// TestRegallocCachePointerInvariant guards buffers retained across functions.
+func TestRegallocCachePointerInvariant(t *testing.T) {
+	pointerFree := []struct {
+		name string
+		typ  *rtabi.Type
+	}{
+		{"liveInfo", rtabi.TypeFor[liveInfo]()},
+		{"desiredStateEntry", rtabi.TypeFor[desiredStateEntry]()},
+	}
+	for _, tc := range pointerFree {
+		if tc.typ.Pointers() {
+			t.Errorf("%s must remain pointer-free (PtrBytes=%d)",
+				tc.name, tc.typ.PtrBytes)
+		}
+	}
+}
+
+func TestRegallocCacheBounds(t *testing.T) {
+	c := &compilerCache{
+		regallocLive:    make([][]liveInfo, maxCachedRegallocBlocks),
+		regallocDesired: make([]desiredState, maxCachedRegallocBlocks),
+	}
+	last := maxCachedRegallocBlocks - 1
+	c.regallocLive[last] = make([]liveInfo, 1, maxCachedRegallocEntries)
+	c.regallocDesired[last].entries = make([]desiredStateEntry, 1, maxCachedRegallocEntries)
+	c.regallocDesired[last].avoid = ssa.RegMaskAt(0)
+	c.resetRegallocScratch()
+
+	// Simulate a smaller next function. Only this prefix can change; the hidden
+	// tail must remain reset and bounded from the preceding reset.
+	c.regallocLive = c.regallocLive[:2]
+	c.regallocDesired = c.regallocDesired[:2]
+	c.regallocLive[0] = make([]liveInfo, 1, maxCachedRegallocEntries+1)
+	c.regallocLive[1] = make([]liveInfo, 1, maxCachedRegallocEntries)
+	c.regallocDesired[0].entries = make([]desiredStateEntry, 1, maxCachedRegallocEntries+1)
+	c.regallocDesired[1].entries = make([]desiredStateEntry, 1, maxCachedRegallocEntries)
+	c.regallocDesired[1].avoid = ssa.RegMaskAt(0)
+
+	c.resetRegallocScratch()
+	live := c.regallocLive[:cap(c.regallocLive)]
+	desired := c.regallocDesired[:cap(c.regallocDesired)]
+	if live[0] != nil || desired[0].entries != nil {
+		t.Fatal("oversized regalloc cache entry was retained")
+	}
+	if len(live[1]) != 0 || cap(live[1]) != maxCachedRegallocEntries ||
+		len(desired[1].entries) != 0 || cap(desired[1].entries) != maxCachedRegallocEntries ||
+		!desired[1].avoid.Empty() {
+		t.Fatal("bounded regalloc cache entry was not reset and retained")
+	}
+	if len(live[last]) != 0 || cap(live[last]) != maxCachedRegallocEntries ||
+		len(desired[last].entries) != 0 || cap(desired[last].entries) != maxCachedRegallocEntries ||
+		!desired[last].avoid.Empty() {
+		t.Fatal("hidden regalloc cache tail was not kept reset and bounded")
+	}
+
+	c.regallocLive = make([][]liveInfo, maxCachedRegallocBlocks+1)
+	c.regallocDesired = make([]desiredState, maxCachedRegallocBlocks+1)
+	c.resetRegallocScratch()
+	if c.regallocLive != nil || c.regallocDesired != nil {
+		t.Fatal("oversized regalloc outer cache was retained")
 	}
 }

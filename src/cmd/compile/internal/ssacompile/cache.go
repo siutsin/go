@@ -11,6 +11,18 @@ type compilerCache struct {
 	latticeCells map[*ssa.Value]lattice
 	defUse       map[*ssa.Value][]*ssa.Value
 	defBlock     map[*ssa.Value][]*ssa.Block
+
+	// Reusable regalloc scratch, retained within fixed per-worker bounds.
+	// The retained inner backing arrays contain pointer-free liveInfo and
+	// desiredStateEntry elements.
+	regallocLive    [][]liveInfo
+	regallocDesired []desiredState
+
+	// Free headers used to put slices in sync.Pools without allocation.
+	hdrRegStateSlice      []*[]regState
+	hdrEndRegSliceSlice   []*[][]endReg
+	hdrStartRegSliceSlice []*[][]startReg
+	hdrIDSliceSlice       []*[][]ssa.ID
 }
 
 func getCompilerCache(c *ssa.Cache) *compilerCache {
