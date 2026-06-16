@@ -10,6 +10,10 @@ import (
 	"cmd/internal/src"
 )
 
+// A Swiss map with 112 entries fits in one 128-slot table at the runtime's
+// 7/8 maximum load. Do not retain maps that need more space.
+const maxCachedLiveInlIdxEntries = 112
+
 // LiveValues returns the live values in f and a list of values that are eligible
 // to be statements in reversed data flow order.
 // The second result is used to help conserve statement boundaries for debugging.
@@ -39,7 +43,11 @@ func LiveValues(f *Func, reachable []bool) (live []bool, liveOrderStmts []*Value
 				continue
 			}
 			if liveInlIdx == nil {
-				liveInlIdx = map[int]bool{}
+				liveInlIdx = f.Cache.deadcodeLiveInlIdx
+				clear(liveInlIdx)
+				if liveInlIdx == nil {
+					liveInlIdx = map[int]bool{}
+				}
 			}
 			liveInlIdx[i] = true
 		}
@@ -48,9 +56,18 @@ func LiveValues(f *Func, reachable []bool) (live []bool, liveOrderStmts []*Value
 			continue
 		}
 		if liveInlIdx == nil {
-			liveInlIdx = map[int]bool{}
+			liveInlIdx = f.Cache.deadcodeLiveInlIdx
+			clear(liveInlIdx)
+			if liveInlIdx == nil {
+				liveInlIdx = map[int]bool{}
+			}
 		}
 		liveInlIdx[i] = true
+	}
+	if len(liveInlIdx) > maxCachedLiveInlIdxEntries {
+		f.Cache.deadcodeLiveInlIdx = nil
+	} else if liveInlIdx != nil {
+		f.Cache.deadcodeLiveInlIdx = liveInlIdx
 	}
 
 	// Find all live values

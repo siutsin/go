@@ -24,6 +24,10 @@ type Cache struct {
 
 	scrPoset []*Poset // scratch poset to be reused
 
+	// Reusable deadcode state. The liveInlIdx set is reused across deadcode
+	// passes for one function, then dropped by Reset.
+	deadcodeLiveInlIdx map[int]bool
+
 	// Reusable regalloc state.
 	RegallocValues []ValState
 
@@ -46,7 +50,10 @@ func (c *Cache) Reset() {
 	nl := sort.Search(len(c.Locs), func(i int) bool { return c.Locs[i] == nil })
 	clear(c.Locs[:nl])
 
-	// regalloc sets the length of c.regallocValues to whatever it may use,
+	// regalloc sets the length of c.RegallocValues to whatever it may use,
 	// so clear according to length.
 	clear(c.RegallocValues)
+
+	// Do not carry one function's map capacity into the next function.
+	c.deadcodeLiveInlIdx = nil
 }
