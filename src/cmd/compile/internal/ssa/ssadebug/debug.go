@@ -57,10 +57,10 @@ type slotCanonicalizer struct {
 	slkeys []ssa.LocalSlot
 }
 
-func newSlotCanonicalizer() *slotCanonicalizer {
+func newSlotCanonicalizer(n int) *slotCanonicalizer {
 	return &slotCanonicalizer{
-		slmap:  make(map[slotKey]SlKeyIdx),
-		slkeys: []ssa.LocalSlot{ssa.LocalSlot{N: nil}},
+		slmap:  make(map[slotKey]SlKeyIdx, n),
+		slkeys: make([]ssa.LocalSlot, 1, n+1),
 	}
 }
 
@@ -144,7 +144,7 @@ func PopulateABIInRegArgOps(f *ssa.Func) {
 	// the debug location analysis will treat that slot as a separate
 	// entity. To achieve this, create a lookup table of existing
 	// slots that is type-insenstitive.
-	sc := newSlotCanonicalizer()
+	sc := newSlotCanonicalizer(len(f.Names))
 	for _, sl := range f.Names {
 		sc.lookup(sl)
 	}
