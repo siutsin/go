@@ -7,6 +7,7 @@ package ssa
 import (
 	"sort"
 
+	"cmd/compile/internal/ir"
 	"cmd/internal/obj"
 )
 
@@ -27,6 +28,11 @@ type Cache struct {
 	// Reusable deadcode state. The liveInlIdx set is reused across deadcode
 	// passes for one function, then dropped by Reset.
 	deadcodeLiveInlIdx map[int]bool
+
+	// Reusable free list of per-block defvars maps used by ssagen SSA
+	// construction. ssagen bounds both the number and size of retained maps
+	// and clears each map before storing it here.
+	DefvarsFree []map[ir.Node]*Value
 
 	// Reusable regalloc state.
 	RegallocValues []ValState

@@ -601,6 +601,9 @@ func buildssa(compiler ssa.Compiler, fn *ir.Func, worker int, isPgoHot bool) (*s
 
 	s.insertPhis()
 
+	// The per-block defvars maps are dead after phi insertion.
+	s.f.Cache.DefvarsFree = cacheDefvarsMaps(s.f.Cache.DefvarsFree, s.defvars)
+
 	// Main call to ssa package to compile function
 	compiler.Compile(s.f, htmlWriter)
 
@@ -1183,13 +1186,48 @@ var (
 	hashVar      = ssaMarker("hash")
 )
 
+// An unhinted Swiss map with 14 entries fits in one 16-slot table at
+// the runtime's 7/8 maximum load; entry 15 grows it to 32 slots.
+// A 128-map pool was the measured knee: raising it to 256 saved only
+// another 0.04 percentage points in allocs/op and B/op while doubling
+// retained table slots and maximum clear work per worker.
+const (
+	maxCachedDefvarsEntries = 14
+	maxCachedDefvarsMaps    = 128
+)
+
+// cacheDefvarsMaps relies on each map's final length being its high-water
+// entry count. Maps start without a size hint and only grow: every
+// delete(s.vars, ...) targets a key absent from the current block's map.
+func cacheDefvarsMaps(free, defvars []map[ir.Node]*ssa.Value) []map[ir.Node]*ssa.Value {
+	for id := 1; id < len(defvars) && id <= maxCachedDefvarsMaps; id++ {
+		if len(free) >= maxCachedDefvarsMaps {
+			break
+		}
+		m := defvars[id]
+		if m == nil || len(m) > maxCachedDefvarsEntries {
+			continue
+		}
+		clear(m)
+		free = append(free, m)
+	}
+	return free
+}
+
 // startBlock sets the current block we're generating code in to b.
 func (s *state) startBlock(b *ssa.Block) {
 	if s.curBlock != nil {
 		s.Fatalf("starting block %v when block %v has not ended", b, s.curBlock)
 	}
 	s.curBlock = b
-	s.vars = map[ir.Node]*ssa.Value{}
+	// Reuse a map cleared after phi insertion in an earlier function, or allocate.
+	if n := len(s.f.Cache.DefvarsFree); n > 0 {
+		s.vars = s.f.Cache.DefvarsFree[n-1]
+		s.f.Cache.DefvarsFree[n-1] = nil
+		s.f.Cache.DefvarsFree = s.f.Cache.DefvarsFree[:n-1]
+	} else {
+		s.vars = map[ir.Node]*ssa.Value{}
+	}
 	clear(s.fwdVars)
 	for len(s.blockStarts) <= int(b.ID) {
 		s.blockStarts = append(s.blockStarts, src.NoXPos)
