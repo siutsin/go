@@ -2389,7 +2389,8 @@ type edgeState struct {
 
 	// for each pre-regalloc value, a list of equivalent cached values
 	cache      map[ssa.ID][]*ssa.Value
-	cachedVals []ssa.ID // (superset of) keys of the above map, for deterministic iteration
+	cachedVals []ssa.ID       // (superset of) keys of the above map, for deterministic iteration
+	cacheFree  [][]*ssa.Value // backing arrays harvested from cache on setup, reused in set
 
 	// map from location to the value it contains
 	contents map[ssa.Location]contentRecord
@@ -2425,6 +2426,15 @@ func (e *edgeState) setup(idx int, srcReg []endReg, dstReg []startReg, stacklive
 	}
 
 	// Clear state.
+	// Harvest the per-vid value-slice backing arrays for reuse in set.
+	// Range the map (unique keys) rather than cachedVals, which can hold
+	// duplicate vids (erase leaves stale entries; set re-appends), so each
+	// backing array is harvested at most once and never aliased.
+	for _, a := range e.cache {
+		if cap(a) > 0 {
+			e.cacheFree = append(e.cacheFree, a[:0])
+		}
+	}
 	clear(e.cache)
 	e.cachedVals = e.cachedVals[:0]
 	clear(e.contents)
@@ -2710,6 +2720,14 @@ func (e *edgeState) set(loc ssa.Location, vid ssa.ID, c *ssa.Value, final bool, 
 	a := e.cache[vid]
 	if len(a) == 0 {
 		e.cachedVals = append(e.cachedVals, vid)
+		if a == nil && len(e.cacheFree) > 0 {
+			// Reuse a harvested backing array. Each is harvested at most
+			// once (see setup), so it cannot alias a still-referenced slice.
+			n := len(e.cacheFree) - 1
+			a = e.cacheFree[n]
+			e.cacheFree[n] = nil
+			e.cacheFree = e.cacheFree[:n]
+		}
 	}
 	a = append(a, c)
 	e.cache[vid] = a
