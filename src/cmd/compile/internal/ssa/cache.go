@@ -34,6 +34,9 @@ type Cache struct {
 	// and clears each map before storing it here.
 	DefvarsFree []map[ir.Node]*Value
 
+	// Reusable state owned by the Compiler implementation.
+	CompilerCache any
+
 	// Reusable regalloc state.
 	RegallocValues []ValState
 

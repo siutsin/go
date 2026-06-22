@@ -66,22 +66,56 @@ type worklist struct {
 	visitedBlock []bool                      // visited block
 }
 
+// A Swiss map with 448 entries fills one 512-slot table. Do not retain maps
+// that need more space.
+const maxCachedSCCPMapEntries = 448
+
+func retainSCCPMap[K comparable, V any](m map[K]V) map[K]V {
+	if len(m) > maxCachedSCCPMapEntries {
+		return nil
+	}
+	clear(m)
+	return m
+}
+
 // sccp stands for sparse conditional constant propagation, it propagates constants
 // through CFG conditionally and applies constant folding, constant replacement and
 // dead code elimination all together.
 func sccp(f *ssa.Func) {
 	var t worklist
 	t.f = f
+	cache := getCompilerCache(f.Cache)
 	t.edges = make([]ssa.Edge, 0)
-	t.visited = make(map[ssa.Edge]bool)
+	// Reuse the four maps. The deferred cleanup below clears every map it
+	// retains. This is required because *Value and *Block addresses are reused
+	// across functions, so a stale entry could silently miscompile.
+	t.visited = cache.visited
+	if t.visited == nil {
+		t.visited = make(map[ssa.Edge]bool)
+	}
 	t.edges = append(t.edges, ssa.Edge{B: f.Entry, I: 0})
-	t.defUse = make(map[*ssa.Value][]*ssa.Value)
-	t.defBlock = make(map[*ssa.Value][]*ssa.Block)
-	t.latticeCells = make(map[*ssa.Value]lattice)
+	t.defUse = cache.defUse
+	if t.defUse == nil {
+		t.defUse = make(map[*ssa.Value][]*ssa.Value)
+	}
+	t.defBlock = cache.defBlock
+	if t.defBlock == nil {
+		t.defBlock = make(map[*ssa.Value][]*ssa.Block)
+	}
+	t.latticeCells = cache.latticeCells
+	if t.latticeCells == nil {
+		t.latticeCells = make(map[*ssa.Value]lattice)
+	}
 	t.visitedBlock = f.Cache.AllocBoolSlice(f.NumBlocks())
 	t.inUses = f.NewSparseSet(f.NumValues())
 	defer f.RetSparseSet(t.inUses)
 	defer f.Cache.FreeBoolSlice(t.visitedBlock)
+	defer func() {
+		cache.visited = retainSCCPMap(t.visited)
+		cache.defUse = retainSCCPMap(t.defUse)
+		cache.defBlock = retainSCCPMap(t.defBlock)
+		cache.latticeCells = retainSCCPMap(t.latticeCells)
+	}()
 
 	// build it early since we rely heavily on the def-use chain later
 	t.buildDefUses()

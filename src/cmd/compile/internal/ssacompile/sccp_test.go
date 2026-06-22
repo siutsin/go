@@ -12,6 +12,31 @@ import (
 	"cmd/compile/internal/types"
 )
 
+func TestRetainSCCPMap(t *testing.T) {
+	retained := make(map[int]int, maxCachedSCCPMapEntries)
+	for i := range maxCachedSCCPMapEntries {
+		retained[i] = i
+	}
+	got := retainSCCPMap(retained)
+	if got == nil {
+		t.Fatal("retainSCCPMap at cap returned nil")
+	}
+	if len(got) != 0 {
+		t.Fatalf("retainSCCPMap at cap has len %d; want 0", len(got))
+	}
+
+	dropped := make(map[int]int, maxCachedSCCPMapEntries+1)
+	for i := range maxCachedSCCPMapEntries + 1 {
+		dropped[i] = i
+	}
+	if got := retainSCCPMap(dropped); got != nil {
+		t.Fatal("retainSCCPMap over cap returned non-nil map")
+	}
+	if len(dropped) != maxCachedSCCPMapEntries+1 {
+		t.Fatalf("dropped map was cleared; len %d, want %d", len(dropped), maxCachedSCCPMapEntries+1)
+	}
+}
+
 func TestSCCPBasic(t *testing.T) {
 	c := testConfig(t)
 	fun := c.Fun("b1",
