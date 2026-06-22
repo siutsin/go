@@ -23,6 +23,10 @@ type compilerCache struct {
 	hdrEndRegSliceSlice   []*[][]endReg
 	hdrStartRegSliceSlice []*[][]startReg
 	hdrIDSliceSlice       []*[][]ssa.ID
+
+	// Reusable prove scratch scoped to one function. Cleanup clears the
+	// pointer-bearing map after each use; Compile drops it after the final use.
+	proveOrderings map[ssa.ID]*ordering
 }
 
 func getCompilerCache(c *ssa.Cache) *compilerCache {

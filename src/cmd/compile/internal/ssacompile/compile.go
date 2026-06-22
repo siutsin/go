@@ -176,6 +176,10 @@ func (_ Compiler) Compile(f *ssa.Func, htmlWriter ssa.HTMLWriter) {
 		fmt.Print(buf.String())
 	}
 
+	cache := getCompilerCache(f.Cache)
+	// Do not carry this function's prove map capacity past this function.
+	cache.proveOrderings = nil
+
 	// Squash error printing defer
 	phaseName = ""
 }

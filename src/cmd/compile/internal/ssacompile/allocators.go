@@ -6,6 +6,7 @@ import (
 	"cmd/compile/internal/ssa"
 	"math/bits"
 	"sync"
+	"unsafe"
 )
 
 var poolFreeRegStateSlice [29]sync.Pool
@@ -151,3 +152,55 @@ func (c *compilerCache) freeIDSliceSlice(s [][]ssa.ID) {
 	*sp = s
 	poolFreeIDSliceSlice[b-3].Put(sp)
 }
+
+// roundUpPowerOfTwo returns the smallest power of two
+// greater than or equal to n. n must be positive.
+func roundUpPowerOfTwo(n int) int {
+	return 1 << bits.Len(uint(n-1))
+}
+func (c *factsTable) allocLimitFactSlice(n int) []limitFact {
+	var base byte
+	var derived limitFact
+	if unsafe.Sizeof(derived)%unsafe.Sizeof(base) != 0 {
+		panic("bad")
+	}
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	b := c.cache.AllocByteSlice(n * int(scale))
+	derivedCap := cap(b) / int(scale)
+	data := (*limitFact)(unsafe.Pointer(unsafe.SliceData(b)))
+	return unsafe.Slice(data, derivedCap)[:n]
+}
+func (c *factsTable) freeLimitFactSlice(s []limitFact) {
+	if cap(s) == 0 {
+		return
+	}
+	var base byte
+	var derived limitFact
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	byteCap := cap(s) * int(scale)
+	byteCap = roundUpPowerOfTwo(byteCap)
+	data := (*byte)(unsafe.Pointer(unsafe.SliceData(s)))
+	b := unsafe.Slice(data, byteCap)
+	c.cache.FreeByteSlice(b)
+}
+
+// appendLimitFactSlice appends elems to s, growing through factsTable when needed.
+// s must be nil or retain the start pointer and capacity returned by
+// allocLimitFactSlice/appendLimitFactSlice; only its length may change.
+// Use only the returned slice; growth returns s's old backing to the pool.
+func (c *factsTable) appendLimitFactSlice(s []limitFact, elems ...limitFact) []limitFact {
+	oldLen := len(s)
+	n := oldLen + len(elems)
+	if n <= cap(s) {
+		s = s[:n]
+		copy(s[oldLen:], elems)
+		return s
+	}
+	ns := c.allocLimitFactSlice(n)
+	copy(ns, s)
+	copy(ns[oldLen:], elems)
+	c.freeLimitFactSlice(s)
+	return ns
+}
+
+var byteSlicePoolElemTypes = []string{"limitFact"}

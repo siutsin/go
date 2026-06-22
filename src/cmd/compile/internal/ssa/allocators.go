@@ -328,6 +328,25 @@ func (c *Cache) FreeIDSlice(s []ID) {
 	b := unsafe.Slice(data, byteCap)
 	c.FreeByteSlice(b)
 }
+
+// AppendIDSlice appends elems to s, growing through Cache when needed.
+// s must be nil or retain the start pointer and capacity returned by
+// AllocIDSlice/AppendIDSlice; only its length may change.
+// Use only the returned slice; growth returns s's old backing to the pool.
+func (c *Cache) AppendIDSlice(s []ID, elems ...ID) []ID {
+	oldLen := len(s)
+	n := oldLen + len(elems)
+	if n <= cap(s) {
+		s = s[:n]
+		copy(s[oldLen:], elems)
+		return s
+	}
+	ns := c.AllocIDSlice(n)
+	copy(ns, s)
+	copy(ns[oldLen:], elems)
+	c.FreeIDSlice(s)
+	return ns
+}
 func (c *Cache) AllocUintSlice(n int) []uint {
 	var base byte
 	var derived uint

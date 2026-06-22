@@ -143,6 +143,8 @@ type ordering struct {
 // by the facts table is effective for real code while remaining very
 // efficient.
 type factsTable struct {
+	cache *ssa.Cache
+
 	// unsat is true if facts contains a contradiction.
 	//
 	// Note that the factsTable logic is incomplete, so if unsat
@@ -188,17 +190,21 @@ type factsTable struct {
 var checkpointBound = limitFact{}
 
 func newFactsTable(f *ssa.Func) *factsTable {
-	ft := &factsTable{}
+	ft := &factsTable{cache: f.Cache}
 	ft.orderS = f.NewPoset()
 	ft.orderU = f.NewPoset()
-	ft.orderings = make(map[ssa.ID]*ordering)
+	cache := getCompilerCache(f.Cache)
+	ft.orderings = cache.proveOrderings
+	if ft.orderings == nil {
+		ft.orderings = make(map[ssa.ID]*ordering)
+	}
 	ft.limits = f.Cache.AllocLimitSlice(f.NumValues())
 	for _, b := range f.Blocks {
 		for _, v := range b.Values {
 			ft.limits[v.ID] = ssa.InitLimit(v)
 		}
 	}
-	ft.limitStack = make([]limitFact, 4)
+	ft.limitStack = ft.allocLimitFactSlice(4)
 	ft.recurseCheck = f.Cache.AllocBoolSlice(f.NumValues())
 	return ft
 }
@@ -312,7 +318,7 @@ func (ft *factsTable) newLimit(v *ssa.Value, newLim ssa.Limit) {
 	}()
 
 	// Record undo information.
-	ft.limitStack = append(ft.limitStack, limitFact{v.ID, oldLim})
+	ft.limitStack = ft.appendLimitFactSlice(ft.limitStack, limitFact{v.ID, oldLim})
 	// Record new information.
 	ft.limits[v.ID] = lim
 	if v.Block.Func.Pass.Debug > 2 {
@@ -483,7 +489,7 @@ func (ft *factsTable) addOrdering(v, w *ssa.Value, d domain, r relation) {
 	o.r = r
 	o.next = ft.orderings[v.ID]
 	ft.orderings[v.ID] = o
-	ft.orderingsStack = append(ft.orderingsStack, v.ID)
+	ft.orderingsStack = ft.cache.AppendIDSlice(ft.orderingsStack, v.ID)
 }
 
 // update updates the set of relations between v and w in domain d
@@ -902,10 +908,10 @@ func (ft *factsTable) checkpoint() {
 	if ft.unsat {
 		ft.unsatDepth++
 	}
-	ft.limitStack = append(ft.limitStack, checkpointBound)
+	ft.limitStack = ft.appendLimitFactSlice(ft.limitStack, checkpointBound)
 	ft.orderS.Checkpoint()
 	ft.orderU.Checkpoint()
-	ft.orderingsStack = append(ft.orderingsStack, 0)
+	ft.orderingsStack = ft.cache.AppendIDSlice(ft.orderingsStack, 0)
 }
 
 // restore restores known relation to the state just
@@ -1000,10 +1006,14 @@ func (ft *factsTable) cleanup(f *ssa.Func) {
 		f.RetPoset(po)
 	}
 	f.Cache.FreeLimitSlice(ft.limits)
+	ft.freeLimitFactSlice(ft.limitStack)
+	f.Cache.FreeIDSlice(ft.orderingsStack)
 	f.Cache.FreeBoolSlice(ft.recurseCheck)
 	if cap(ft.reusedTopoSortIDsToBlockIndexes) > 0 {
 		f.Cache.FreeUintSlice(ft.reusedTopoSortIDsToBlockIndexes)
 	}
+	clear(ft.orderings)
+	getCompilerCache(f.Cache).proveOrderings = ft.orderings
 }
 
 // addSlicesOfSameLen finds the slices that are in the same block and whose Op

@@ -30,9 +30,10 @@ type allocator struct {
 }
 
 type derived struct {
-	name string // name for alloc/free functions
-	typ  string // the type they return/accept
-	base string // underlying allocator
+	name   string // name for alloc/free functions
+	typ    string // the type they return/accept
+	base   string // underlying allocator
+	append bool   // generate an append helper that grows through this allocator
 }
 
 func genAllocators() {
@@ -184,9 +185,10 @@ func genAllocators() {
 			base: "ByteSlice",
 		},
 		{
-			name: "IDSlice",
-			typ:  "[]ID",
-			base: "ByteSlice",
+			name:   "IDSlice",
+			typ:    "[]ID",
+			base:   "ByteSlice",
+			append: true,
 		},
 		{
 			name: "UintSlice",
@@ -197,6 +199,14 @@ func genAllocators() {
 			name: "KnownBitsEntriesSlice",
 			typ:  "[]knownBitsEntry",
 			base: "ByteSlice",
+		},
+	}
+	compilerDeriveds := []derived{
+		{
+			name:   "LimitFactSlice",
+			typ:    "[]limitFact",
+			base:   "ByteSlice",
+			append: true,
 		},
 	}
 
@@ -222,7 +232,10 @@ func genAllocators() {
 	for _, d := range deriveds {
 		for _, base := range allocators {
 			if base.name == d.base {
-				genDerived(w, d, base, "Cache", splitTitle)
+				genDerived(w, d, base, "Cache", splitTitle, "c", splitTitle)
+				if d.append {
+					genAppend(w, d.name, d.typ, "Cache", splitTitle)
+				}
 				break
 			}
 		}
@@ -260,10 +273,36 @@ func genAllocators() {
 	fmt.Fprintln(w, "\"cmd/compile/internal/ssa\"")
 	fmt.Fprintln(w, "\"math/bits\"")
 	fmt.Fprintln(w, "\"sync\"")
+	fmt.Fprintln(w, "\"unsafe\"")
 	fmt.Fprintln(w, ")")
 	for _, a := range compilerAllocators {
 		genAllocator(w, a, "compilerCache", identity)
 	}
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "// roundUpPowerOfTwo returns the smallest power of two")
+	fmt.Fprintln(w, "// greater than or equal to n. n must be positive.")
+	fmt.Fprintln(w, "func roundUpPowerOfTwo(n int) int {")
+	fmt.Fprintln(w, "return 1 << bits.Len(uint(n-1))")
+	fmt.Fprintln(w, "}")
+	for _, d := range compilerDeriveds {
+		for _, base := range allocators {
+			if base.name == d.base {
+				genDerived(w, d, base, "factsTable", identity, "c.cache", splitTitle)
+				if d.append {
+					genAppend(w, d.name, d.typ, "factsTable", identity)
+				}
+				break
+			}
+		}
+	}
+	// Keep the package's pointer-layout test synchronized with the generator.
+	var compilerByteSliceElems []string
+	for _, d := range compilerDeriveds {
+		if d.base == "ByteSlice" {
+			compilerByteSliceElems = append(compilerByteSliceElems, fmt.Sprintf("%q", d.typ[2:]))
+		}
+	}
+	fmt.Fprintf(w, "\nvar byteSlicePoolElemTypes = []string{%s}\n", strings.Join(compilerByteSliceElems, ", "))
 	b, err = format.Source(w.Bytes())
 	if err != nil {
 		fmt.Printf("%s\n", w.Bytes())
@@ -320,7 +359,36 @@ func genAllocator(w io.Writer, a allocator, cacheType string, title func(string)
 	}
 	fmt.Fprintf(w, "}\n")
 }
-func genDerived(w io.Writer, d derived, base allocator, cacheType string, title func(string) string) {
+
+func genAppend(w io.Writer, name, typ, cacheType string, title func(string) string) {
+	if typ[:2] != "[]" {
+		panic(fmt.Sprintf("bad append type: %s", typ))
+	}
+	elem := typ[2:]
+	appendName := title("append") + name
+	allocName := title("alloc") + name
+	freeName := title("free") + name
+	fmt.Fprintf(w, "// %s appends elems to s, growing through %s when needed.\n", appendName, cacheType)
+	fmt.Fprintf(w, "// s must be nil or retain the start pointer and capacity returned by\n")
+	fmt.Fprintf(w, "// %s/%s; only its length may change.\n", allocName, appendName)
+	fmt.Fprintf(w, "// Use only the returned slice; growth returns s's old backing to the pool.\n")
+	fmt.Fprintf(w, "func (c *%s) %s(s %s, elems ...%s) %s {\n", cacheType, appendName, typ, elem, typ)
+	fmt.Fprintf(w, "oldLen := len(s)\n")
+	fmt.Fprintf(w, "n := oldLen + len(elems)\n")
+	fmt.Fprintf(w, "if n <= cap(s) {\n")
+	fmt.Fprintf(w, "  s = s[:n]\n")
+	fmt.Fprintf(w, "  copy(s[oldLen:], elems)\n")
+	fmt.Fprintf(w, "  return s\n")
+	fmt.Fprintf(w, "}\n")
+	fmt.Fprintf(w, "ns := c.%s(n)\n", allocName)
+	fmt.Fprintf(w, "copy(ns, s)\n")
+	fmt.Fprintf(w, "copy(ns[oldLen:], elems)\n")
+	fmt.Fprintf(w, "c.%s(s)\n", freeName)
+	fmt.Fprintf(w, "return ns\n")
+	fmt.Fprintf(w, "}\n")
+}
+
+func genDerived(w io.Writer, d derived, base allocator, cacheType string, title func(string) string, baseReceiver string, baseTitle func(string) string) {
 	if d.typ[:2] != "[]" || base.typ[:2] != "[]" {
 		panic(fmt.Sprintf("bad derived types: %s %s", d.typ, base.typ))
 	}
@@ -333,11 +401,11 @@ func genDerived(w io.Writer, d derived, base allocator, cacheType string, title 
 	if byteBase {
 		fmt.Fprintf(w, "if unsafe.Sizeof(derived)%%unsafe.Sizeof(base) != 0 { panic(\"bad\") }\n")
 		fmt.Fprintf(w, "scale := unsafe.Sizeof(derived)/unsafe.Sizeof(base)\n")
-		fmt.Fprintf(w, "b := c.%s%s(n*int(scale))\n", title("alloc"), base.name)
+		fmt.Fprintf(w, "b := %s.%s%s(n*int(scale))\n", baseReceiver, baseTitle("alloc"), base.name)
 	} else {
 		fmt.Fprintf(w, "if unsafe.Sizeof(base)%%unsafe.Sizeof(derived) != 0 { panic(\"bad\") }\n")
 		fmt.Fprintf(w, "scale := unsafe.Sizeof(base)/unsafe.Sizeof(derived)\n")
-		fmt.Fprintf(w, "b := c.%s%s(int((uintptr(n)+scale-1)/scale))\n", title("alloc"), base.name)
+		fmt.Fprintf(w, "b := %s.%s%s(int((uintptr(n)+scale-1)/scale))\n", baseReceiver, baseTitle("alloc"), base.name)
 	}
 	if byteBase {
 		fmt.Fprintf(w, "derivedCap := cap(b)/int(scale)\n")
@@ -369,6 +437,6 @@ func genDerived(w io.Writer, d derived, base allocator, cacheType string, title 
 		fmt.Fprintf(w, "data := (*%s)(unsafe.Pointer(unsafe.SliceData(s)))\n", base.typ[2:])
 		fmt.Fprintf(w, "b := unsafe.Slice(data, baseCap)\n")
 	}
-	fmt.Fprintf(w, "c.%s%s(b)\n", title("free"), base.name)
+	fmt.Fprintf(w, "%s.%s%s(b)\n", baseReceiver, baseTitle("free"), base.name)
 	fmt.Fprintf(w, "}\n")
 }
