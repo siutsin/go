@@ -48,7 +48,7 @@ type Cache struct {
 	// Free "headers" for use by the allocators in allocators.go.
 	// Used to put slices in sync.Pools without allocation.
 	hdrValueSlice []*[]*Value
-	hdrLimitSlice []*[]Limit
+	hdrByteSlice  []*[]byte
 }
 
 func (c *Cache) Reset() {

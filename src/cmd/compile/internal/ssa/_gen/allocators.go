@@ -4,8 +4,9 @@
 
 package main
 
-// TODO: should we share backing storage for similarly-shaped types?
-// e.g. []*Value and []*Block, or even []int32 and []bool.
+// Pointer-free derived slices share ByteSlice's no-scan backing arrays.
+// Pointer-bearing slices must use scanned pools; []*Block can share []*Value
+// because their elements have compatible pointer layouts.
 
 import (
 	"bytes"
@@ -14,6 +15,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 )
 
 type allocator struct {
@@ -46,14 +48,22 @@ func genAllocators() {
 			maxLog:   32,
 		},
 		{
-			name:     "LimitSlice",
-			typ:      "[]limit", // the limit type is basically [4]uint64.
+			// ByteSlice backs pointer-free derived slices. Its no-scan backing
+			// must never hold pointers. Tests guard this invariant.
+			//
+			// The 256-byte minimum bypasses the tiny allocator. Regular heap
+			// allocations satisfy the alignment required by every derived type.
+			// Tests check each type's size and alignment and the actual backing
+			// address. Limiting element sizes to 256 bytes also makes power-of-two
+			// bucket reconstruction exact.
+			name:     "ByteSlice",
+			typ:      "[]byte",
 			capacity: "cap(%s)",
-			mak:      "make([]limit, %s)",
+			mak:      "make([]byte, %s)",
 			resize:   "%s[:%s]",
-			clear:    "clear(%s)",
-			minLog:   3,
-			maxLog:   30,
+			clear:    "clear(%[1]s[:cap(%[1]s)])",
+			minLog:   8,
+			maxLog:   36,
 		},
 		{
 			name:     "SparseSet",
@@ -86,9 +96,9 @@ func genAllocators() {
 			maxLog:   32,
 		},
 	}
+	limitType := "[]limit"
 	if splitPhase >= phase0Export {
-		allocators[1].typ = "[]Limit"
-		allocators[1].mak = "make([]Limit, %s)"
+		limitType = "[]Limit"
 		allocators[2].typ = "*SparseSet"
 		allocators[2].mak = "NewSparseSet(%s)"
 		allocators[2].clear = "%s.Clear()"
@@ -149,44 +159,44 @@ func genAllocators() {
 			base: "ValueSlice",
 		},
 		{
-			name: "Int64",
-			typ:  "[]int64",
-			base: "LimitSlice",
+			name: "LimitSlice",
+			typ:  limitType,
+			base: "ByteSlice",
 		},
 		{
 			name: "IntSlice",
 			typ:  "[]int",
-			base: "LimitSlice",
+			base: "ByteSlice",
 		},
 		{
 			name: "Int32Slice",
 			typ:  "[]int32",
-			base: "LimitSlice",
+			base: "ByteSlice",
 		},
 		{
 			name: "Int8Slice",
 			typ:  "[]int8",
-			base: "LimitSlice",
+			base: "ByteSlice",
 		},
 		{
 			name: "BoolSlice",
 			typ:  "[]bool",
-			base: "LimitSlice",
+			base: "ByteSlice",
 		},
 		{
 			name: "IDSlice",
 			typ:  "[]ID",
-			base: "LimitSlice",
+			base: "ByteSlice",
 		},
 		{
 			name: "UintSlice",
 			typ:  "[]uint",
-			base: "LimitSlice",
+			base: "ByteSlice",
 		},
 		{
 			name: "KnownBitsEntriesSlice",
 			typ:  "[]knownBitsEntry",
-			base: "LimitSlice",
+			base: "ByteSlice",
 		},
 	}
 
@@ -196,11 +206,16 @@ func genAllocators() {
 	fmt.Fprintf(w, "package %s\n", splitCorePkg)
 
 	fmt.Fprintln(w, "import (")
-	fmt.Fprintln(w, "\"internal/unsafeheader\"")
 	fmt.Fprintln(w, "\"math/bits\"")
 	fmt.Fprintln(w, "\"sync\"")
 	fmt.Fprintln(w, "\"unsafe\"")
 	fmt.Fprintln(w, ")")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "// roundUpPowerOfTwo returns the smallest power of two")
+	fmt.Fprintln(w, "// greater than or equal to n. n must be positive.")
+	fmt.Fprintln(w, "func roundUpPowerOfTwo(n int) int {")
+	fmt.Fprintln(w, "return 1 << bits.Len(uint(n-1))")
+	fmt.Fprintln(w, "}")
 	for _, a := range allocators {
 		genAllocator(w, a, "Cache", splitTitle)
 	}
@@ -212,6 +227,16 @@ func genAllocators() {
 			}
 		}
 	}
+
+	// Emit ByteSlice-derived element names so the pointer-layout test stays
+	// synchronized with the generator.
+	var byteSliceElems []string
+	for _, d := range deriveds {
+		if d.base == "ByteSlice" {
+			byteSliceElems = append(byteSliceElems, fmt.Sprintf("%q", d.typ[2:]))
+		}
+	}
+	fmt.Fprintf(w, "\nvar byteSlicePoolElemTypes = []string{%s}\n", strings.Join(byteSliceElems, ", "))
 	// gofmt result
 	b := w.Bytes()
 	var err error
@@ -296,31 +321,54 @@ func genAllocator(w io.Writer, a allocator, cacheType string, title func(string)
 	fmt.Fprintf(w, "}\n")
 }
 func genDerived(w io.Writer, d derived, base allocator, cacheType string, title func(string) string) {
-	fmt.Fprintf(w, "func (c *%s) %s%s(n int) %s {\n", cacheType, title("alloc"), d.name, d.typ)
 	if d.typ[:2] != "[]" || base.typ[:2] != "[]" {
 		panic(fmt.Sprintf("bad derived types: %s %s", d.typ, base.typ))
 	}
+	// ByteSlice scales in bytes per derived element; typed bases scale in
+	// derived elements per base element.
+	byteBase := base.typ == "[]byte"
+	fmt.Fprintf(w, "func (c *%s) %s%s(n int) %s {\n", cacheType, title("alloc"), d.name, d.typ)
 	fmt.Fprintf(w, "var base %s\n", base.typ[2:])
 	fmt.Fprintf(w, "var derived %s\n", d.typ[2:])
-	fmt.Fprintf(w, "if unsafe.Sizeof(base)%%unsafe.Sizeof(derived) != 0 { panic(\"bad\") }\n")
-	fmt.Fprintf(w, "scale := unsafe.Sizeof(base)/unsafe.Sizeof(derived)\n")
-	fmt.Fprintf(w, "b := c.%s%s(int((uintptr(n)+scale-1)/scale))\n", title("alloc"), base.name)
-	fmt.Fprintf(w, "s := unsafeheader.Slice {\n")
-	fmt.Fprintf(w, "  Data: unsafe.Pointer(&b[0]),\n")
-	fmt.Fprintf(w, "  Len: n,\n")
-	fmt.Fprintf(w, "  Cap: cap(b)*int(scale),\n")
-	fmt.Fprintf(w, "  }\n")
-	fmt.Fprintf(w, "return *(*%s)(unsafe.Pointer(&s))\n", d.typ)
+	if byteBase {
+		fmt.Fprintf(w, "if unsafe.Sizeof(derived)%%unsafe.Sizeof(base) != 0 { panic(\"bad\") }\n")
+		fmt.Fprintf(w, "scale := unsafe.Sizeof(derived)/unsafe.Sizeof(base)\n")
+		fmt.Fprintf(w, "b := c.%s%s(n*int(scale))\n", title("alloc"), base.name)
+	} else {
+		fmt.Fprintf(w, "if unsafe.Sizeof(base)%%unsafe.Sizeof(derived) != 0 { panic(\"bad\") }\n")
+		fmt.Fprintf(w, "scale := unsafe.Sizeof(base)/unsafe.Sizeof(derived)\n")
+		fmt.Fprintf(w, "b := c.%s%s(int((uintptr(n)+scale-1)/scale))\n", title("alloc"), base.name)
+	}
+	if byteBase {
+		fmt.Fprintf(w, "derivedCap := cap(b)/int(scale)\n")
+	} else {
+		fmt.Fprintf(w, "derivedCap := cap(b)*int(scale)\n")
+	}
+	fmt.Fprintf(w, "data := (*%s)(unsafe.Pointer(unsafe.SliceData(b)))\n", d.typ[2:])
+	fmt.Fprintf(w, "return unsafe.Slice(data, derivedCap)[:n]\n")
 	fmt.Fprintf(w, "}\n")
 	fmt.Fprintf(w, "func (c *%s) %s%s(s %s) {\n", cacheType, title("free"), d.name, d.typ)
+	fmt.Fprintf(w, "if cap(s) == 0 { return }\n")
+	// Free converts the derived slice back to the base slice by capacity
+	// rather than length. A caller may return a zero-length slice that still
+	// owns pooled storage.
 	fmt.Fprintf(w, "var base %s\n", base.typ[2:])
 	fmt.Fprintf(w, "var derived %s\n", d.typ[2:])
-	fmt.Fprintf(w, "scale := unsafe.Sizeof(base)/unsafe.Sizeof(derived)\n")
-	fmt.Fprintf(w, "b := unsafeheader.Slice {\n")
-	fmt.Fprintf(w, "  Data: unsafe.Pointer(&s[0]),\n")
-	fmt.Fprintf(w, "  Len: int((uintptr(len(s))+scale-1)/scale),\n")
-	fmt.Fprintf(w, "  Cap: int((uintptr(cap(s))+scale-1)/scale),\n")
-	fmt.Fprintf(w, "  }\n")
-	fmt.Fprintf(w, "c.%s%s(*(*%s)(unsafe.Pointer(&b)))\n", title("free"), base.name, base.typ)
+	if byteBase {
+		fmt.Fprintf(w, "scale := unsafe.Sizeof(derived)/unsafe.Sizeof(base)\n")
+		// cap(s) omits trailing bytes that do not form a complete element.
+		// Round up to recover the original power-of-two byte bucket. The
+		// pointer-invariant test limits element size so this is exact.
+		fmt.Fprintf(w, "byteCap := cap(s)*int(scale)\n")
+		fmt.Fprintf(w, "byteCap = roundUpPowerOfTwo(byteCap)\n")
+		fmt.Fprintf(w, "data := (*%s)(unsafe.Pointer(unsafe.SliceData(s)))\n", base.typ[2:])
+		fmt.Fprintf(w, "b := unsafe.Slice(data, byteCap)\n")
+	} else {
+		fmt.Fprintf(w, "scale := unsafe.Sizeof(base)/unsafe.Sizeof(derived)\n")
+		fmt.Fprintf(w, "baseCap := int((uintptr(cap(s))+scale-1)/scale)\n")
+		fmt.Fprintf(w, "data := (*%s)(unsafe.Pointer(unsafe.SliceData(s)))\n", base.typ[2:])
+		fmt.Fprintf(w, "b := unsafe.Slice(data, baseCap)\n")
+	}
+	fmt.Fprintf(w, "c.%s%s(b)\n", title("free"), base.name)
 	fmt.Fprintf(w, "}\n")
 }

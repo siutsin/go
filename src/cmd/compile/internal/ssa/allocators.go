@@ -3,11 +3,16 @@
 package ssa
 
 import (
-	"internal/unsafeheader"
 	"math/bits"
 	"sync"
 	"unsafe"
 )
+
+// roundUpPowerOfTwo returns the smallest power of two
+// greater than or equal to n. n must be positive.
+func roundUpPowerOfTwo(n int) int {
+	return 1 << bits.Len(uint(n-1))
+}
 
 var poolFreeValueSlice [27]sync.Pool
 
@@ -45,40 +50,40 @@ func (c *Cache) FreeValueSlice(s []*Value) {
 	poolFreeValueSlice[b-5].Put(sp)
 }
 
-var poolFreeLimitSlice [27]sync.Pool
+var poolFreeByteSlice [28]sync.Pool
 
-func (c *Cache) AllocLimitSlice(n int) []Limit {
-	var s []Limit
+func (c *Cache) AllocByteSlice(n int) []byte {
+	var s []byte
 	n2 := n
-	if n2 < 8 {
-		n2 = 8
+	if n2 < 256 {
+		n2 = 256
 	}
 	b := bits.Len(uint(n2 - 1))
-	v := poolFreeLimitSlice[b-3].Get()
+	v := poolFreeByteSlice[b-8].Get()
 	if v == nil {
-		s = make([]Limit, 1<<b)
+		s = make([]byte, 1<<b)
 	} else {
-		sp := v.(*[]Limit)
+		sp := v.(*[]byte)
 		s = *sp
 		*sp = nil
-		c.hdrLimitSlice = append(c.hdrLimitSlice, sp)
+		c.hdrByteSlice = append(c.hdrByteSlice, sp)
 	}
 	s = s[:n]
 	return s
 }
-func (c *Cache) FreeLimitSlice(s []Limit) {
-	clear(s)
+func (c *Cache) FreeByteSlice(s []byte) {
+	clear(s[:cap(s)])
 	b := bits.Len(uint(cap(s)) - 1)
-	var sp *[]Limit
-	if len(c.hdrLimitSlice) == 0 {
-		sp = new([]Limit)
+	var sp *[]byte
+	if len(c.hdrByteSlice) == 0 {
+		sp = new([]byte)
 	} else {
-		sp = c.hdrLimitSlice[len(c.hdrLimitSlice)-1]
-		c.hdrLimitSlice[len(c.hdrLimitSlice)-1] = nil
-		c.hdrLimitSlice = c.hdrLimitSlice[:len(c.hdrLimitSlice)-1]
+		sp = c.hdrByteSlice[len(c.hdrByteSlice)-1]
+		c.hdrByteSlice[len(c.hdrByteSlice)-1] = nil
+		c.hdrByteSlice = c.hdrByteSlice[:len(c.hdrByteSlice)-1]
 	}
 	*sp = s
-	poolFreeLimitSlice[b-3].Put(sp)
+	poolFreeByteSlice[b-8].Put(sp)
 }
 
 var poolFreeSparseSet [27]sync.Pool
@@ -157,229 +162,221 @@ func (c *Cache) AllocBlockSlice(n int) []*Block {
 	}
 	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
 	b := c.AllocValueSlice(int((uintptr(n) + scale - 1) / scale))
-	s := unsafeheader.Slice{
-		Data: unsafe.Pointer(&b[0]),
-		Len:  n,
-		Cap:  cap(b) * int(scale),
-	}
-	return *(*[]*Block)(unsafe.Pointer(&s))
+	derivedCap := cap(b) * int(scale)
+	data := (**Block)(unsafe.Pointer(unsafe.SliceData(b)))
+	return unsafe.Slice(data, derivedCap)[:n]
 }
 func (c *Cache) FreeBlockSlice(s []*Block) {
+	if cap(s) == 0 {
+		return
+	}
 	var base *Value
 	var derived *Block
 	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := unsafeheader.Slice{
-		Data: unsafe.Pointer(&s[0]),
-		Len:  int((uintptr(len(s)) + scale - 1) / scale),
-		Cap:  int((uintptr(cap(s)) + scale - 1) / scale),
-	}
-	c.FreeValueSlice(*(*[]*Value)(unsafe.Pointer(&b)))
+	baseCap := int((uintptr(cap(s)) + scale - 1) / scale)
+	data := (**Value)(unsafe.Pointer(unsafe.SliceData(s)))
+	b := unsafe.Slice(data, baseCap)
+	c.FreeValueSlice(b)
 }
-func (c *Cache) AllocInt64(n int) []int64 {
-	var base Limit
-	var derived int64
-	if unsafe.Sizeof(base)%unsafe.Sizeof(derived) != 0 {
+func (c *Cache) AllocLimitSlice(n int) []Limit {
+	var base byte
+	var derived Limit
+	if unsafe.Sizeof(derived)%unsafe.Sizeof(base) != 0 {
 		panic("bad")
 	}
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := c.AllocLimitSlice(int((uintptr(n) + scale - 1) / scale))
-	s := unsafeheader.Slice{
-		Data: unsafe.Pointer(&b[0]),
-		Len:  n,
-		Cap:  cap(b) * int(scale),
-	}
-	return *(*[]int64)(unsafe.Pointer(&s))
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	b := c.AllocByteSlice(n * int(scale))
+	derivedCap := cap(b) / int(scale)
+	data := (*Limit)(unsafe.Pointer(unsafe.SliceData(b)))
+	return unsafe.Slice(data, derivedCap)[:n]
 }
-func (c *Cache) FreeInt64(s []int64) {
-	var base Limit
-	var derived int64
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := unsafeheader.Slice{
-		Data: unsafe.Pointer(&s[0]),
-		Len:  int((uintptr(len(s)) + scale - 1) / scale),
-		Cap:  int((uintptr(cap(s)) + scale - 1) / scale),
+func (c *Cache) FreeLimitSlice(s []Limit) {
+	if cap(s) == 0 {
+		return
 	}
-	c.FreeLimitSlice(*(*[]Limit)(unsafe.Pointer(&b)))
+	var base byte
+	var derived Limit
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	byteCap := cap(s) * int(scale)
+	byteCap = roundUpPowerOfTwo(byteCap)
+	data := (*byte)(unsafe.Pointer(unsafe.SliceData(s)))
+	b := unsafe.Slice(data, byteCap)
+	c.FreeByteSlice(b)
 }
 func (c *Cache) AllocIntSlice(n int) []int {
-	var base Limit
+	var base byte
 	var derived int
-	if unsafe.Sizeof(base)%unsafe.Sizeof(derived) != 0 {
+	if unsafe.Sizeof(derived)%unsafe.Sizeof(base) != 0 {
 		panic("bad")
 	}
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := c.AllocLimitSlice(int((uintptr(n) + scale - 1) / scale))
-	s := unsafeheader.Slice{
-		Data: unsafe.Pointer(&b[0]),
-		Len:  n,
-		Cap:  cap(b) * int(scale),
-	}
-	return *(*[]int)(unsafe.Pointer(&s))
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	b := c.AllocByteSlice(n * int(scale))
+	derivedCap := cap(b) / int(scale)
+	data := (*int)(unsafe.Pointer(unsafe.SliceData(b)))
+	return unsafe.Slice(data, derivedCap)[:n]
 }
 func (c *Cache) FreeIntSlice(s []int) {
-	var base Limit
-	var derived int
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := unsafeheader.Slice{
-		Data: unsafe.Pointer(&s[0]),
-		Len:  int((uintptr(len(s)) + scale - 1) / scale),
-		Cap:  int((uintptr(cap(s)) + scale - 1) / scale),
+	if cap(s) == 0 {
+		return
 	}
-	c.FreeLimitSlice(*(*[]Limit)(unsafe.Pointer(&b)))
+	var base byte
+	var derived int
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	byteCap := cap(s) * int(scale)
+	byteCap = roundUpPowerOfTwo(byteCap)
+	data := (*byte)(unsafe.Pointer(unsafe.SliceData(s)))
+	b := unsafe.Slice(data, byteCap)
+	c.FreeByteSlice(b)
 }
 func (c *Cache) AllocInt32Slice(n int) []int32 {
-	var base Limit
+	var base byte
 	var derived int32
-	if unsafe.Sizeof(base)%unsafe.Sizeof(derived) != 0 {
+	if unsafe.Sizeof(derived)%unsafe.Sizeof(base) != 0 {
 		panic("bad")
 	}
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := c.AllocLimitSlice(int((uintptr(n) + scale - 1) / scale))
-	s := unsafeheader.Slice{
-		Data: unsafe.Pointer(&b[0]),
-		Len:  n,
-		Cap:  cap(b) * int(scale),
-	}
-	return *(*[]int32)(unsafe.Pointer(&s))
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	b := c.AllocByteSlice(n * int(scale))
+	derivedCap := cap(b) / int(scale)
+	data := (*int32)(unsafe.Pointer(unsafe.SliceData(b)))
+	return unsafe.Slice(data, derivedCap)[:n]
 }
 func (c *Cache) FreeInt32Slice(s []int32) {
-	var base Limit
-	var derived int32
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := unsafeheader.Slice{
-		Data: unsafe.Pointer(&s[0]),
-		Len:  int((uintptr(len(s)) + scale - 1) / scale),
-		Cap:  int((uintptr(cap(s)) + scale - 1) / scale),
+	if cap(s) == 0 {
+		return
 	}
-	c.FreeLimitSlice(*(*[]Limit)(unsafe.Pointer(&b)))
+	var base byte
+	var derived int32
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	byteCap := cap(s) * int(scale)
+	byteCap = roundUpPowerOfTwo(byteCap)
+	data := (*byte)(unsafe.Pointer(unsafe.SliceData(s)))
+	b := unsafe.Slice(data, byteCap)
+	c.FreeByteSlice(b)
 }
 func (c *Cache) AllocInt8Slice(n int) []int8 {
-	var base Limit
+	var base byte
 	var derived int8
-	if unsafe.Sizeof(base)%unsafe.Sizeof(derived) != 0 {
+	if unsafe.Sizeof(derived)%unsafe.Sizeof(base) != 0 {
 		panic("bad")
 	}
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := c.AllocLimitSlice(int((uintptr(n) + scale - 1) / scale))
-	s := unsafeheader.Slice{
-		Data: unsafe.Pointer(&b[0]),
-		Len:  n,
-		Cap:  cap(b) * int(scale),
-	}
-	return *(*[]int8)(unsafe.Pointer(&s))
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	b := c.AllocByteSlice(n * int(scale))
+	derivedCap := cap(b) / int(scale)
+	data := (*int8)(unsafe.Pointer(unsafe.SliceData(b)))
+	return unsafe.Slice(data, derivedCap)[:n]
 }
 func (c *Cache) FreeInt8Slice(s []int8) {
-	var base Limit
-	var derived int8
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := unsafeheader.Slice{
-		Data: unsafe.Pointer(&s[0]),
-		Len:  int((uintptr(len(s)) + scale - 1) / scale),
-		Cap:  int((uintptr(cap(s)) + scale - 1) / scale),
+	if cap(s) == 0 {
+		return
 	}
-	c.FreeLimitSlice(*(*[]Limit)(unsafe.Pointer(&b)))
+	var base byte
+	var derived int8
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	byteCap := cap(s) * int(scale)
+	byteCap = roundUpPowerOfTwo(byteCap)
+	data := (*byte)(unsafe.Pointer(unsafe.SliceData(s)))
+	b := unsafe.Slice(data, byteCap)
+	c.FreeByteSlice(b)
 }
 func (c *Cache) AllocBoolSlice(n int) []bool {
-	var base Limit
+	var base byte
 	var derived bool
-	if unsafe.Sizeof(base)%unsafe.Sizeof(derived) != 0 {
+	if unsafe.Sizeof(derived)%unsafe.Sizeof(base) != 0 {
 		panic("bad")
 	}
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := c.AllocLimitSlice(int((uintptr(n) + scale - 1) / scale))
-	s := unsafeheader.Slice{
-		Data: unsafe.Pointer(&b[0]),
-		Len:  n,
-		Cap:  cap(b) * int(scale),
-	}
-	return *(*[]bool)(unsafe.Pointer(&s))
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	b := c.AllocByteSlice(n * int(scale))
+	derivedCap := cap(b) / int(scale)
+	data := (*bool)(unsafe.Pointer(unsafe.SliceData(b)))
+	return unsafe.Slice(data, derivedCap)[:n]
 }
 func (c *Cache) FreeBoolSlice(s []bool) {
-	var base Limit
-	var derived bool
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := unsafeheader.Slice{
-		Data: unsafe.Pointer(&s[0]),
-		Len:  int((uintptr(len(s)) + scale - 1) / scale),
-		Cap:  int((uintptr(cap(s)) + scale - 1) / scale),
+	if cap(s) == 0 {
+		return
 	}
-	c.FreeLimitSlice(*(*[]Limit)(unsafe.Pointer(&b)))
+	var base byte
+	var derived bool
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	byteCap := cap(s) * int(scale)
+	byteCap = roundUpPowerOfTwo(byteCap)
+	data := (*byte)(unsafe.Pointer(unsafe.SliceData(s)))
+	b := unsafe.Slice(data, byteCap)
+	c.FreeByteSlice(b)
 }
 func (c *Cache) AllocIDSlice(n int) []ID {
-	var base Limit
+	var base byte
 	var derived ID
-	if unsafe.Sizeof(base)%unsafe.Sizeof(derived) != 0 {
+	if unsafe.Sizeof(derived)%unsafe.Sizeof(base) != 0 {
 		panic("bad")
 	}
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := c.AllocLimitSlice(int((uintptr(n) + scale - 1) / scale))
-	s := unsafeheader.Slice{
-		Data: unsafe.Pointer(&b[0]),
-		Len:  n,
-		Cap:  cap(b) * int(scale),
-	}
-	return *(*[]ID)(unsafe.Pointer(&s))
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	b := c.AllocByteSlice(n * int(scale))
+	derivedCap := cap(b) / int(scale)
+	data := (*ID)(unsafe.Pointer(unsafe.SliceData(b)))
+	return unsafe.Slice(data, derivedCap)[:n]
 }
 func (c *Cache) FreeIDSlice(s []ID) {
-	var base Limit
-	var derived ID
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := unsafeheader.Slice{
-		Data: unsafe.Pointer(&s[0]),
-		Len:  int((uintptr(len(s)) + scale - 1) / scale),
-		Cap:  int((uintptr(cap(s)) + scale - 1) / scale),
+	if cap(s) == 0 {
+		return
 	}
-	c.FreeLimitSlice(*(*[]Limit)(unsafe.Pointer(&b)))
+	var base byte
+	var derived ID
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	byteCap := cap(s) * int(scale)
+	byteCap = roundUpPowerOfTwo(byteCap)
+	data := (*byte)(unsafe.Pointer(unsafe.SliceData(s)))
+	b := unsafe.Slice(data, byteCap)
+	c.FreeByteSlice(b)
 }
 func (c *Cache) AllocUintSlice(n int) []uint {
-	var base Limit
+	var base byte
 	var derived uint
-	if unsafe.Sizeof(base)%unsafe.Sizeof(derived) != 0 {
+	if unsafe.Sizeof(derived)%unsafe.Sizeof(base) != 0 {
 		panic("bad")
 	}
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := c.AllocLimitSlice(int((uintptr(n) + scale - 1) / scale))
-	s := unsafeheader.Slice{
-		Data: unsafe.Pointer(&b[0]),
-		Len:  n,
-		Cap:  cap(b) * int(scale),
-	}
-	return *(*[]uint)(unsafe.Pointer(&s))
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	b := c.AllocByteSlice(n * int(scale))
+	derivedCap := cap(b) / int(scale)
+	data := (*uint)(unsafe.Pointer(unsafe.SliceData(b)))
+	return unsafe.Slice(data, derivedCap)[:n]
 }
 func (c *Cache) FreeUintSlice(s []uint) {
-	var base Limit
-	var derived uint
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := unsafeheader.Slice{
-		Data: unsafe.Pointer(&s[0]),
-		Len:  int((uintptr(len(s)) + scale - 1) / scale),
-		Cap:  int((uintptr(cap(s)) + scale - 1) / scale),
+	if cap(s) == 0 {
+		return
 	}
-	c.FreeLimitSlice(*(*[]Limit)(unsafe.Pointer(&b)))
+	var base byte
+	var derived uint
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	byteCap := cap(s) * int(scale)
+	byteCap = roundUpPowerOfTwo(byteCap)
+	data := (*byte)(unsafe.Pointer(unsafe.SliceData(s)))
+	b := unsafe.Slice(data, byteCap)
+	c.FreeByteSlice(b)
 }
 func (c *Cache) AllocKnownBitsEntriesSlice(n int) []knownBitsEntry {
-	var base Limit
+	var base byte
 	var derived knownBitsEntry
-	if unsafe.Sizeof(base)%unsafe.Sizeof(derived) != 0 {
+	if unsafe.Sizeof(derived)%unsafe.Sizeof(base) != 0 {
 		panic("bad")
 	}
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := c.AllocLimitSlice(int((uintptr(n) + scale - 1) / scale))
-	s := unsafeheader.Slice{
-		Data: unsafe.Pointer(&b[0]),
-		Len:  n,
-		Cap:  cap(b) * int(scale),
-	}
-	return *(*[]knownBitsEntry)(unsafe.Pointer(&s))
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	b := c.AllocByteSlice(n * int(scale))
+	derivedCap := cap(b) / int(scale)
+	data := (*knownBitsEntry)(unsafe.Pointer(unsafe.SliceData(b)))
+	return unsafe.Slice(data, derivedCap)[:n]
 }
 func (c *Cache) FreeKnownBitsEntriesSlice(s []knownBitsEntry) {
-	var base Limit
-	var derived knownBitsEntry
-	scale := unsafe.Sizeof(base) / unsafe.Sizeof(derived)
-	b := unsafeheader.Slice{
-		Data: unsafe.Pointer(&s[0]),
-		Len:  int((uintptr(len(s)) + scale - 1) / scale),
-		Cap:  int((uintptr(cap(s)) + scale - 1) / scale),
+	if cap(s) == 0 {
+		return
 	}
-	c.FreeLimitSlice(*(*[]Limit)(unsafe.Pointer(&b)))
+	var base byte
+	var derived knownBitsEntry
+	scale := unsafe.Sizeof(derived) / unsafe.Sizeof(base)
+	byteCap := cap(s) * int(scale)
+	byteCap = roundUpPowerOfTwo(byteCap)
+	data := (*byte)(unsafe.Pointer(unsafe.SliceData(s)))
+	b := unsafe.Slice(data, byteCap)
+	c.FreeByteSlice(b)
 }
+
+var byteSlicePoolElemTypes = []string{"Limit", "int", "int32", "int8", "bool", "ID", "uint", "knownBitsEntry"}
